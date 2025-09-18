@@ -4,3 +4,5 @@ pandas
 python-dotenv
 requests
 optuna
+fastapi
+uvicorn
