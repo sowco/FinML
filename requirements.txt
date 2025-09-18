@@ -1,0 +1,6 @@
+pybit
+backtesting
+pandas
+python-dotenv
+requests
+optuna
