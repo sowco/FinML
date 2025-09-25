@@ -1,0 +1,226 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.1-python3.10
+  env_file:
+    - .env
+  environment: &airflow-common-env
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CELERY__BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    AIRFLOW__WEBSERVER__BASE_URL: http://${SERVER_HOST}:8880/airflow
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+  networks:
+    - internal
+    - default
+
+services:
+  registry:
+    image: registry:2
+    container_name: registry
+    ports:
+      - "5101:5000"
+    networks:      
+      - internal   
+    environment:
+      REGISTRY_HTTP_SECRET: ${REGISTRY_SECRET}
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Registry Realm
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+    volumes:
+      - ./registry:/var/lib/registry
+      - ./registry-auth:/auth
+
+  postgres:
+    env_file:
+      - .env
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+    networks:
+      - internal
+      - default
+
+  redis:
+    env_file:
+      - .env
+    image: redis:7-alpine
+    container_name: redis
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    networks:
+      - internal
+      - default
+
+  airflow-init:
+    <<: *airflow-common
+    env_file:
+      - .env
+    container_name: airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      <<: *airflow-common-env
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+      AIRFLOW_ADMIN_EMAIL: ${AIRFLOW_ADMIN_EMAIL}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    command: >
+      bash -c "
+        echo 'Waiting for Postgres...'
+        until pg_isready -h postgres -U $POSTGRES_USER; do sleep 1; done
+        echo 'Postgres is ready. Initializing Airflow DB...'
+        airflow db init
+        echo 'Creating admin user...'
+        airflow users create --username $AIRFLOW_ADMIN_USER --password $AIRFLOW_ADMIN_PASSWORD --firstname Admin --lastname User --role Admin --email $AIRFLOW_ADMIN_EMAIL || true
+      "
+    restart: "no"
+
+
+  airflow-webserver:
+    <<: *airflow-common
+    env_file:
+      - .env
+    container_name: airflow-webserver
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "8880:8080"
+    environment:
+      - AIRFLOW__WEBSERVER__WORKERS=2
+      - GUNICORN_TIMEOUT=300
+      - AIRFLOW_ADMIN_USER=${AIRFLOW_ADMIN_USER}
+      - AIRFLOW_ADMIN_PASSWORD=${AIRFLOW_ADMIN_PASSWORD}
+      - AIRFLOW_ADMIN_EMAIL=${AIRFLOW_ADMIN_EMAIL}
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    command: >
+      bash -c "
+        echo 'Waiting for Postgres...'
+        until pg_isready -h postgres -U ${POSTGRES_USER}; do sleep 1; done
+        echo 'Postgres ready, starting webserver'
+        airflow webserver
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  airflow-scheduler:
+    <<: *airflow-common
+    env_file:
+      - .env
+    container_name: airflow-scheduler
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-common-env
+      _PIP_ADDITIONAL_REQUIREMENTS: ""
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 10
+      AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: 5
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__LOGGING_LEVEL: DEBUG
+    command: scheduler
+
+  airflow-worker:
+    <<: *airflow-common
+    env_file:
+      - .env
+    container_name: airflow-worker
+    user: "0:0"
+    restart: always
+    #depends_on:
+    #  airflow-init:
+    #    condition: service_completed_successfully
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      docker-in-docker:  
+        condition: service_started
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__LOGGING_LEVEL: DEBUG
+    #command: celery worker
+    command: ["sleep", "infinity"] 
+    #healthcheck:
+    #  test: ["CMD-SHELL", "airflow jobs check --job-type WorkerJob --hostname $(hostname)"]
+    #  interval: 30s
+    #  timeout: 10s
+    #  retries: 5
+
+  airflow-triggerer:
+    <<: *airflow-common
+    env_file:
+      - .env
+    container_name: airflow-triggerer
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__LOGGING_LEVEL: DEBUG
+    command: triggerer
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    networks:
+      - internal
+      - default
+      
+  docker-in-docker:
+      image: docker:24-dind
+      container_name: docker-in-docker
+      privileged: true
+      dns:
+        - 8.8.8.8
+        - 1.1.1.1
+      networks:
+        - internal
+        - default
+      environment:
+        DOCKER_TLS_CERTDIR: "" 
+      volumes:
+        - /home/sowco/dags/otus:/home/sowco/dags/otus
+        - /home/sowco/.env:/home/sowco/.env
+        - /tmp:/tmp
+      command: --host=tcp://0.0.0.0:2375 --host=unix:///var/run/docker.sock --insecure-registry="registry:5000"
+  
+volumes:
+  postgres_data:
+
+networks:
+  internal:
+    internal: true

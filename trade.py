@@ -1,12 +1,11 @@
 import os
+import sys
 import time
-import datetime
+from datetime import datetime, timezone
 import requests
-import pandas as pd
+import json
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
-from backtesting import Backtest, Strategy
-from datetime import datetime, timezone
 from utils import df_coin, add_features, wait_for_candle, send_telegram_message
 
 load_dotenv()
@@ -16,36 +15,40 @@ API_SECRET = os.getenv("api_secret_bybit")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-session = HTTP(testnet=True, api_key=API_KEY, api_secret=API_SECRET)
+session = HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
 
+# === Загрузка сохраненных лучших результатов ===
+RESULTS_FILE = "/app/best_results.json"
+if os.path.exists(RESULTS_FILE):
+    with open(RESULTS_FILE, "r") as f:
+        best_results = json.load(f)
+    constants = best_results.get("constants")
+    if not constants:
+        print("❌ Ошибка: файл best_results.json не содержит раздел 'constants'. Завершаем работу.")
+        sys.exit(1)
 
-def wait_for_candle(interval_min: int) -> float:
-    now = datetime.now(timezone.utc)
-    current_interval_start = now.replace(second=0, microsecond=0)
-    seconds_past = (now - current_interval_start.replace(minute=(now.minute // interval_min) * interval_min)).total_seconds()
-    sleep_secs = (interval_min * 60) - seconds_past
-    if sleep_secs <= 0:
-        sleep_secs += interval_min * 60
-    return sleep_secs + 1
-
-
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
-        response = requests.post(url, data=payload)
-        response.raise_for_status()
-        print("Сообщение отправлено в Telegram")
-    except requests.exceptions.RequestException as e:
-        print(f"Ошибка отправки сообщения: {e}")
+        TP = constants["TP"]
+        SL = constants["SL"]
+        CASH = constants["CASH"]
+        COIN = constants["COIN"]
+        INTERVAL = constants["INTERVAL"]
+    except KeyError as e:
+        print(f"❌ Ошибка: отсутствует константа {e} в файле best_results.json. Завершаем работу.")
+        sys.exit(1)
+else:
+    print(f"❌ Ошибка: файл {RESULTS_FILE} не найден. Завершаем работу.")
+    sys.exit(1)
+
+print(f"Используемые константы: TP={TP}, SL={SL}, CASH={CASH}, COIN={COIN}, INTERVAL={INTERVAL}")
 
 
 def place_new_order(session: HTTP, cfg: dict, coin: str, signal: int, price: float, qty: float) -> bool:
     side = 'Buy' if signal > 0 else 'Sell'
-    tp_perc = cfg.get('tp', 0.1)
-    sl_perc = cfg.get('sl', 0.015)
-    leverage = float(cfg.get('leverage', 2))
+    tp_perc = cfg.get('tp', TP)
+    sl_perc = cfg.get('sl', SL)
     price_precision = cfg.get('price_precision', 5)
+    
     try:
         if signal > 0:
             tp_price = price * (1 + tp_perc)
@@ -57,7 +60,7 @@ def place_new_order(session: HTTP, cfg: dict, coin: str, signal: int, price: flo
         tp_price = round(tp_price, price_precision)
         sl_price = round(sl_price, price_precision)
         order_price = round(price, price_precision)
-    except:
+    except Exception:
         ticker = session.get_tickers(category="linear", symbol=coin)
         if not ticker or 'result' not in ticker or 'list' not in ticker['result']:
             print("Не удалось получить цену тикера.")
@@ -89,17 +92,17 @@ def place_new_order(session: HTTP, cfg: dict, coin: str, signal: int, price: flo
     return response['retCode'] == 0 and 'orderId' in response['result']
 
 
-if __name__ == "__main__":
-    coin = "BTCUSDT"
-    cfg = {"tp": 0.01, "sl": 0.005, "leverage": 2, "price_precision": 2}
-    balance_start = 1000.0
+def run_trading_loop(coin=COIN, balance_start=CASH, cfg=None):
+    if cfg is None:
+        cfg = {"tp": TP, "sl": SL, "leverage": 2, "price_precision": 2}
+
     balance = balance_start
 
     while True:
-        df = df_coin(period=2, interval=1, coin=coin)
+        df = df_coin(session, period=2, interval=INTERVAL, coin=coin)
         df = add_features(df)
         signal = df.iloc[-1]['Signal']
-        price = df.iloc[-1]['prices_close']
+        price = df.iloc[-1]['Close']
         qty = 0.01
 
         if signal != 0:
@@ -112,5 +115,9 @@ if __name__ == "__main__":
         if balance < balance_start * 0.9:
             send_telegram_message("⚠️ Баланс снизился на 10%!")
 
-        sleep_time = wait_for_candle(1)
+        sleep_time = wait_for_candle(INTERVAL)
         time.sleep(sleep_time)
+
+
+if __name__ == "__main__":
+    run_trading_loop()
